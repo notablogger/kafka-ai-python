@@ -1,16 +1,16 @@
 import os
 import time
+import urllib.request
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.network import Network
 from testcontainers.kafka import KafkaContainer
 from testcontainers.mongodb import MongoDbContainer
 from testcontainers.postgres import PostgresContainer
-from testcontainers.core.container import DockerContainer
-from testcontainers.core.network import Network
-
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from src.db.postgres import Base
 
@@ -33,33 +33,51 @@ def postgres_container():
 
 @pytest.fixture(scope="session")
 def kafka_container(docker_network):
-    with KafkaContainer(image=KAFKA_IMAGE) as kafka:
-        kafka.with_network(docker_network)
-        kafka.with_network_aliases("kafka")
+    # CRITICAL: configure network and alias BEFORE the context manager starts the container.
+    # Calling .with_network() inside "with KafkaContainer() as k:" is too late —
+    # the container has already started without the network attached.
+    kafka = KafkaContainer(image=KAFKA_IMAGE)
+    kafka.with_network(docker_network)
+    kafka.with_network_aliases("kafka")
+    with kafka:
         yield kafka
 
 
 @pytest.fixture(scope="session")
 def schema_registry_container(kafka_container, docker_network):
-    kafka_internal = f"PLAINTEXT://kafka:9092"
-    container = (
-        DockerContainer(SCHEMA_REGISTRY_IMAGE)
-        .with_network(docker_network)
-        .with_env("SCHEMA_REGISTRY_HOST_NAME", "schema-registry")
-        .with_env("SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS", kafka_internal)
-        .with_env("SCHEMA_REGISTRY_LISTENERS", "http://0.0.0.0:8081")
-        .with_exposed_ports(8081)
+    # KafkaContainer exposes the BROKER listener on port 9093 (PLAINTEXT protocol).
+    # Schema Registry connects to this via the shared Docker network using the alias.
+    container = DockerContainer(SCHEMA_REGISTRY_IMAGE)
+    container.with_network(docker_network)
+    container.with_env("SCHEMA_REGISTRY_HOST_NAME", "schema-registry")
+    container.with_env(
+        "SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS",
+        "PLAINTEXT://kafka:9093",  # BROKER listener port on the shared network
     )
+    container.with_env("SCHEMA_REGISTRY_LISTENERS", "http://0.0.0.0:8081")
+    container.with_exposed_ports(8081)
+
     with container:
-        # Wait for Schema Registry to be ready
-        import urllib.request
-        sr_url = f"http://localhost:{container.get_exposed_port(8081)}/subjects"
-        for _ in range(30):
+        # Poll until Schema Registry HTTP endpoint responds (up to 90s).
+        # Must confirm readiness here — env_setup calls get_exposed_port() on this
+        # container and will fail if SR has crashed or hasn't finished starting.
+        sr_port = container.get_exposed_port(8081)
+        sr_url = f"http://localhost:{sr_port}/subjects"
+        ready = False
+        for _ in range(90):
             try:
                 urllib.request.urlopen(sr_url, timeout=2)
+                ready = True
                 break
             except Exception:
                 time.sleep(1)
+
+        if not ready:
+            raise RuntimeError(
+                "Schema Registry did not become ready within 90s. "
+                "Ensure Kafka is reachable at kafka:9093 on the shared Docker network."
+            )
+
         yield container
 
 
@@ -71,7 +89,9 @@ def mongodb_container():
 
 @pytest.fixture(scope="session")
 def env_setup(postgres_container, kafka_container, schema_registry_container, mongodb_container):
-    pg_url = postgres_container.get_connection_url().replace("postgresql+psycopg2", "postgresql+asyncpg")
+    pg_url = postgres_container.get_connection_url().replace(
+        "postgresql+psycopg2", "postgresql+asyncpg"
+    )
     sr_port = schema_registry_container.get_exposed_port(8081)
 
     os.environ["POSTGRES_URL"] = pg_url
@@ -103,7 +123,9 @@ async def setup_db(env_setup):
 
 @pytest_asyncio.fixture(scope="session")
 async def client(env_setup, setup_db):
-    # Re-import app AFTER env vars are set so config picks them up
+    # Import app AFTER env vars are set — pydantic-settings reads them at import time.
     from src.main import app
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as ac:
         yield ac
