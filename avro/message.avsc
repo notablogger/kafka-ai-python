@@ -1,0 +1,25 @@
+{
+  "type": "record",
+  "name": "EmployeeEvent",
+  "namespace": "com.training.kafka.avro",
+  "fields": [
+    { "name": "id",           "type": "long" },
+    { "name": "firstName",    "type": "string" },
+    { "name": "lastName",     "type": "string" },
+    { "name": "email",        "type": "string" },
+    { "name": "salary",       "type": { "type": "bytes", "logicalType": "decimal", "precision": 18, "scale": 2 } },
+    { "name": "hireDate",     "type": { "type": "int",   "logicalType": "date" } },
+    { "name": "department",   "type": {
+        "type": "record",
+        "name": "DepartmentInfo",
+        "fields": [
+          { "name": "id",       "type": "long" },
+          { "name": "name",     "type": "string" },
+          { "name": "location", "type": "string" }
+        ]
+      }
+    },
+    { "name": "eventType",    "type": { "type": "enum", "name": "EventType", "symbols": ["CREATED", "UPDATED", "DELETED"] } },
+    { "name": "eventTimestamp", "type": "long", "logicalType": "timestamp-millis" }
+  ]
+}
