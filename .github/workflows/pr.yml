@@ -1,0 +1,118 @@
+name: PR Build
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. Branch name lint ───────────────────────────────────────────────────────
+  branch-lint:
+    name: Branch name
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch name
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          echo "Branch: $BRANCH"
+          if ! echo "$BRANCH" | grep -qE '^(feat|fix|docs|test|chore|refactor|ci)/[a-z0-9][a-z0-9\-]*[a-z0-9]$'; then
+            echo "::error::Branch '$BRANCH' does not follow the required pattern."
+            echo "::error::Expected: <type>/<kebab-case-description>"
+            echo "::error::Types: feat, fix, docs, test, chore, refactor, ci"
+            echo "::error::Example: feat/add-employee-bulk-import"
+            exit 1
+          fi
+
+  # ── 2. PR title lint ─────────────────────────────────────────────────────────
+  title-lint:
+    name: PR title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title follows Conventional Commits
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "PR title: $TITLE"
+          if ! echo "$TITLE" | grep -qE '^(feat|fix|docs|test|chore|refactor|ci|perf|revert)(\([a-z]+\))?: .{1,72}$'; then
+            echo "::error::PR title '$TITLE' does not follow Conventional Commits."
+            echo "::error::Format: type(scope): short description"
+            echo "::error::Example: feat(employee): add bulk import endpoint"
+            exit 1
+          fi
+
+  # ── 3. Test ───────────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: [ branch-lint, title-lint ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run tests
+        run: uv run pytest tests/ -v --tb=short
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-test-results
+          path: .pytest_cache/
+          retention-days: 3
+
+  # ── 4. Docker build check ─────────────────────────────────────────────────────
+  build-check:
+    name: Docker build check
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: notablogger/kafka-ai-python:pr-${{ github.event.pull_request.number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── 5. PR gate ────────────────────────────────────────────────────────────────
+  pr-gate:
+    name: PR gate (all checks passed)
+    runs-on: ubuntu-latest
+    needs: [ branch-lint, title-lint, test, build-check ]
+    if: always()
+    steps:
+      - name: Check all jobs succeeded
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results"
+          if echo "$results" | grep -q '"result": "failure"'; then
+            echo "::error::One or more required checks failed."
+            exit 1
+          fi
+          echo "All required checks passed ✅"
